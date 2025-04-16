@@ -1,0 +1,20 @@
+{% extends 'base.html' %}
+
+{% block title %}Вход в панель администратора{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-md-6 offset-md-3">
+        <h2 class="mb-4 text-center">Вход в панель администратора</h2>
+        <form action="{{ url_for('admin') }}" method="post">
+            <div class="form-group mb-3">
+                <label for="password">Пароль администратора:</label>
+                <input type="password" class="form-control" id="password" name="password" required>
+            </div>
+            <div class="d-grid">
+                <button type="submit" class="btn btn-primary">Войти</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %} 
