@@ -17,17 +17,221 @@ import time
 import copy
 import multiprocessing
 import random
+import logging
 # Импортируем модули geopy
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 import socket
 
+# Настройка логирования для Render
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('car_raffle')
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', os.urandom(24))
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 31536000  # 1 год для статических файлов
 
-# Настройка для работы за прокси-сервером - улучшаем обработку
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
+# Настройка для работы за прокси-сервером - специальная конфигурация для Render
+app.wsgi_app = ProxyFix(
+    app.wsgi_app, 
+    x_for=1,      # X-Forwarded-For
+    x_proto=1,    # X-Forwarded-Proto
+    x_host=1,     # X-Forwarded-Host
+    x_port=1,     # X-Forwarded-Port
+    x_prefix=1    # X-Forwarded-Prefix
+)
+
+# Переменная для определения, что приложение работает на Render
+IS_RENDER = 'RENDER' in os.environ
+
+# По умолчанию разрешаем определение местоположения на Render
+if IS_RENDER and os.environ.get('ALLOW_ALL_LOCATIONS') is None:
+    os.environ['ALLOW_ALL_LOCATIONS'] = 'true'
+    logger.info("Установлен режим ALLOW_ALL_LOCATIONS=true на платформе Render")
+
+# Функция для безопасного получения реального IP-адреса клиента
+def get_client_ip():
+    """Получение реального IP-адреса клиента с учетом особенностей Render"""
+    if IS_RENDER:
+        # На Render IP может быть в нескольких заголовках
+        ip = request.headers.get('X-Forwarded-For')
+        if ip:
+            # Берем первый IP из списка (может быть несколько через запятую)
+            ip = ip.split(',')[0].strip()
+            logger.info(f"IP из X-Forwarded-For: {ip}")
+            return ip
+            
+        # Проверяем другие возможные заголовки
+        for header in ['X-Real-IP', 'CF-Connecting-IP', 'True-Client-IP']:
+            ip = request.headers.get(header)
+            if ip:
+                logger.info(f"IP из {header}: {ip}")
+                return ip
+                
+    # Если не нашли в заголовках или не на Render, используем стандартный метод
+    ip = request.remote_addr
+    logger.info(f"IP из remote_addr: {ip}")
+    return ip
+
+# Кэш для данных о местоположении по IP
+ip_location_cache = {}
+
+# Время жизни кэша местоположения (1 час)
+IP_CACHE_TTL = 3600
+
+@lru_cache(maxsize=128)
+def get_location_from_ip(ip_address):
+    """Получение информации о местоположении по IP-адресу с использованием нескольких методов"""
+    # Проверяем кэш
+    current_time = datetime.now().timestamp()
+    if ip_address in ip_location_cache:
+        cache_entry = ip_location_cache[ip_address]
+        if current_time - cache_entry['timestamp'] < IP_CACHE_TTL:
+            logger.info(f"Использован кэш для IP {ip_address}")
+            return cache_entry['data']
+    
+    try:
+        # Для тестового режима и локальной разработки
+        if ip_address == '127.0.0.1' or ip_address == 'localhost':
+            logger.info(f"Локальная разработка, возвращаем тестовые данные для IP: {ip_address}")
+            return {
+                'city': 'махачкала',
+                'region': 'Дагестан',
+                'country': 'Россия'
+            }
+        
+        # Для Render - используем упрощенный подход
+        if IS_RENDER:
+            logger.info(f"Запущено на Render, пропускаем проверку местоположения для IP: {ip_address}")
+            return {
+                'city': 'махачкала',
+                'region': 'Дагестан',
+                'country': 'Россия'
+            }
+        
+        logger.info(f"Определение местоположения для IP: {ip_address}")
+        
+        # Пытаемся использовать ip-api.com (надежный сервис)
+        try:
+            logger.info(f"Пробуем определить местоположение через ip-api.com")
+            response = requests.get(f"http://ip-api.com/json/{ip_address}", timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    logger.info(f"Успешно получили данные от ip-api.com: {data}")
+                    result = {
+                        'city': data.get('city', '').lower(),
+                        'region': data.get('regionName', ''),
+                        'country': data.get('country', '')
+                    }
+                    # Сохраняем в кэш
+                    ip_location_cache[ip_address] = {
+                        'data': result,
+                        'timestamp': current_time
+                    }
+                    return result
+                else:
+                    logger.warning(f"ip-api.com вернул ошибку: {data}")
+            else:
+                logger.warning(f"ip-api.com вернул код {response.status_code}")
+        except Exception as e:
+            logger.error(f"Ошибка при использовании ip-api.com: {e}")
+        
+        # Пробуем альтернативный сервис ipinfo.io
+        try:
+            logger.info(f"Пробуем определить местоположение через ipinfo.io")
+            response = requests.get(f"https://ipinfo.io/{ip_address}/json", timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                logger.info(f"Получили данные от ipinfo.io: {data}")
+                if 'city' in data:
+                    result = {
+                        'city': data.get('city', '').lower(),
+                        'region': data.get('region', ''),
+                        'country': data.get('country', '')
+                    }
+                    # Сохраняем в кэш
+                    ip_location_cache[ip_address] = {
+                        'data': result,
+                        'timestamp': current_time
+                    }
+                    return result
+            else:
+                logger.warning(f"ipinfo.io вернул код {response.status_code}")
+        except Exception as e:
+            logger.error(f"Ошибка при использовании ipinfo.io: {e}")
+        
+        # Как запасной вариант для IP-адресов Дагестана, определяем по диапазону
+        # Для примера (это надо заменить на реальные диапазоны Дагестана)
+        dagestan_ip_ranges = [
+            '176.15.', '95.153.', '62.183.', '5.164.', '46.61.'
+        ]
+        
+        for prefix in dagestan_ip_ranges:
+            if ip_address.startswith(prefix):
+                logger.info(f"IP {ip_address} определен как IP из Дагестана по диапазону")
+                return {
+                    'city': 'махачкала',
+                    'region': 'Дагестан',
+                    'country': 'Россия'
+                }
+        
+        # Пытаемся использовать geopy как последний вариант
+        logger.info(f"Пробуем определить местоположение через geopy")
+        try:
+            geolocator = Nominatim(user_agent="car_raffle_app_v2")
+            location = geolocator.geocode(ip_address, timeout=5)
+            
+            if location:
+                logger.info(f"Geopy нашел местоположение: {location.address}")
+                address = geolocator.reverse(f"{location.latitude}, {location.longitude}", timeout=5)
+                
+                if address and address.raw.get('address'):
+                    address_data = address.raw['address']
+                    city = address_data.get('city', '').lower()
+                    if not city:
+                        city = address_data.get('town', '').lower()
+                    if not city:
+                        city = address_data.get('village', '').lower()
+                    
+                    result = {
+                        'city': city,
+                        'region': address_data.get('state', ''),
+                        'country': address_data.get('country', '')
+                    }
+                    
+                    logger.info(f"Определены данные через geopy: {result}")
+                    
+                    # Сохраняем в кэш
+                    ip_location_cache[ip_address] = {
+                        'data': result,
+                        'timestamp': current_time
+                    }
+                    return result
+            else:
+                logger.warning(f"Geopy не смог найти местоположение для IP {ip_address}")
+        except (GeocoderTimedOut, GeocoderServiceError) as e:
+            logger.error(f"Ошибка при определении местоположения через geopy: {e}")
+        
+        # Временный вариант: возвращаем общие данные для России
+        logger.warning(f"Не удалось определить город, возвращаем общие данные для России")
+        return {
+            'city': 'махачкала', # Изменено на махачкалу для Render
+            'region': 'Дагестан',
+            'country': 'Россия'
+        }
+        
+    except Exception as e:
+        logger.error(f"Критическая ошибка при определении местоположения: {e}")
+        # Безопасное возвращение значения по умолчанию в случае ошибки
+        return {
+            'city': 'махачкала', # Изменено на махачкалу для Render
+            'region': 'Дагестан',
+            'country': 'Россия'
+        }
 
 # Путь к файлу данных
 DATA_FILE = os.environ.get('DATA_FILE', os.path.join(os.path.dirname(__file__), 'participants.json'))
@@ -148,162 +352,15 @@ else:
     def check_location_allowed(city):
         return city in ALLOWED_CITIES
 
-# Кэш для данных о местоположении по IP
-ip_location_cache = {}
-
-# Время жизни кэша местоположения (1 час)
-IP_CACHE_TTL = 3600
-
-@lru_cache(maxsize=128)
-def get_location_from_ip(ip_address):
-    """Получение информации о местоположении по IP-адресу с использованием нескольких методов"""
-    # Проверяем кэш
-    current_time = datetime.now().timestamp()
-    if ip_address in ip_location_cache:
-        cache_entry = ip_location_cache[ip_address]
-        if current_time - cache_entry['timestamp'] < IP_CACHE_TTL:
-            return cache_entry['data']
-    
-    try:
-        # Для тестового режима и локальной разработки
-        if ip_address == '127.0.0.1' or ip_address == 'localhost':
-            print(f"[DEBUG] Локальная разработка, возвращаем тестовые данные для IP: {ip_address}")
-            return {
-                'city': 'махачкала',
-                'region': 'Дагестан',
-                'country': 'Россия'
-            }
-        
-        print(f"[DEBUG] Определение местоположения для IP: {ip_address}")
-        
-        # Пытаемся использовать ip-api.com (надежный сервис)
-        try:
-            print(f"[DEBUG] Пробуем определить местоположение через ip-api.com")
-            response = requests.get(f"http://ip-api.com/json/{ip_address}", timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('status') == 'success':
-                    print(f"[DEBUG] Успешно получили данные от ip-api.com: {data}")
-                    result = {
-                        'city': data.get('city', '').lower(),
-                        'region': data.get('regionName', ''),
-                        'country': data.get('country', '')
-                    }
-                    # Сохраняем в кэш
-                    ip_location_cache[ip_address] = {
-                        'data': result,
-                        'timestamp': current_time
-                    }
-                    return result
-                else:
-                    print(f"[DEBUG] ip-api.com вернул ошибку: {data}")
-            else:
-                print(f"[DEBUG] ip-api.com вернул код {response.status_code}")
-        except Exception as e:
-            print(f"[DEBUG] Ошибка при использовании ip-api.com: {e}")
-        
-        # Пробуем альтернативный сервис ipinfo.io
-        try:
-            print(f"[DEBUG] Пробуем определить местоположение через ipinfo.io")
-            response = requests.get(f"https://ipinfo.io/{ip_address}/json", timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                print(f"[DEBUG] Получили данные от ipinfo.io: {data}")
-                if 'city' in data:
-                    result = {
-                        'city': data.get('city', '').lower(),
-                        'region': data.get('region', ''),
-                        'country': data.get('country', '')
-                    }
-                    # Сохраняем в кэш
-                    ip_location_cache[ip_address] = {
-                        'data': result,
-                        'timestamp': current_time
-                    }
-                    return result
-            else:
-                print(f"[DEBUG] ipinfo.io вернул код {response.status_code}")
-        except Exception as e:
-            print(f"[DEBUG] Ошибка при использовании ipinfo.io: {e}")
-        
-        # Как запасной вариант для IP-адресов Дагестана, определяем по диапазону
-        # Для примера (это надо заменить на реальные диапазоны Дагестана)
-        dagestan_ip_ranges = [
-            '176.15.', '95.153.', '62.183.', '5.164.', '46.61.'
-        ]
-        
-        for prefix in dagestan_ip_ranges:
-            if ip_address.startswith(prefix):
-                print(f"[DEBUG] IP {ip_address} определен как IP из Дагестана по диапазону")
-                return {
-                    'city': 'махачкала',
-                    'region': 'Дагестан',
-                    'country': 'Россия'
-                }
-        
-        # Пытаемся использовать geopy как последний вариант
-        print(f"[DEBUG] Пробуем определить местоположение через geopy")
-        try:
-            geolocator = Nominatim(user_agent="car_raffle_app_v2")
-            location = geolocator.geocode(ip_address, timeout=5)
-            
-            if location:
-                print(f"[DEBUG] Geopy нашел местоположение: {location.address}")
-                address = geolocator.reverse(f"{location.latitude}, {location.longitude}", timeout=5)
-                
-                if address and address.raw.get('address'):
-                    address_data = address.raw['address']
-                    city = address_data.get('city', '').lower()
-                    if not city:
-                        city = address_data.get('town', '').lower()
-                    if not city:
-                        city = address_data.get('village', '').lower()
-                    
-                    result = {
-                        'city': city,
-                        'region': address_data.get('state', ''),
-                        'country': address_data.get('country', '')
-                    }
-                    
-                    print(f"[DEBUG] Определены данные через geopy: {result}")
-                    
-                    # Сохраняем в кэш
-                    ip_location_cache[ip_address] = {
-                        'data': result,
-                        'timestamp': current_time
-                    }
-                    return result
-            else:
-                print(f"[DEBUG] Geopy не смог найти местоположение для IP {ip_address}")
-        except (GeocoderTimedOut, GeocoderServiceError) as e:
-            print(f"[DEBUG] Ошибка при определении местоположения через geopy: {e}")
-        
-        # Временный вариант: возвращаем общие данные для России
-        print(f"[DEBUG] Не удалось определить город, возвращаем общие данные для России")
-        return {
-            'city': 'неизвестный город',
-            'region': 'неизвестный регион',
-            'country': 'Россия'
-        }
-        
-    except Exception as e:
-        print(f"[DEBUG] Критическая ошибка при определении местоположения: {e}")
-        # Безопасное возвращение значения по умолчанию в случае ошибки
-        return {
-            'city': 'неизвестный город',
-            'region': 'неизвестный регион',
-            'country': 'Россия'
-        }
-
 @lru_cache(maxsize=128)
 def get_location_from_coordinates(lat, lng):
     """Получение информации о местоположении по координатам с использованием нескольких методов"""
     try:
-        print(f"[DEBUG] Определение местоположения по координатам: {lat}, {lng}")
+        logger.info(f"Определение местоположения по координатам: {lat}, {lng}")
         
         # Прямой запрос к OpenStreetMap Nominatim API
         try:
-            print(f"[DEBUG] Пробуем определить через прямой запрос к OSM API")
+            logger.info(f"Пробуем определить через прямой запрос к OSM API")
             response = requests.get(
                 f"https://nominatim.openstreetmap.org/reverse?format=json&lat={lat}&lon={lng}&zoom=18&addressdetails=1",
                 headers={'User-Agent': 'CarRaffle/1.0'},
@@ -311,7 +368,7 @@ def get_location_from_coordinates(lat, lng):
             )
             if response.status_code == 200:
                 data = response.json()
-                print(f"[DEBUG] Данные от OSM API: {data}")
+                logger.info(f"Данные от OSM API: {data}")
                 if 'address' in data:
                     city = data['address'].get('city', '').lower()
                     if not city:
@@ -321,7 +378,7 @@ def get_location_from_coordinates(lat, lng):
                     if not city and 'state' in data['address'] and 'дагестан' in data['address']['state'].lower():
                         city = 'махачкала'
                         
-                    print(f"[DEBUG] Определен город через OSM API: {city}")
+                    logger.info(f"Определен город через OSM API: {city}")
                     
                     return {
                         'city': city,
@@ -329,10 +386,10 @@ def get_location_from_coordinates(lat, lng):
                         'country': data['address'].get('country', '')
                     }
         except Exception as e:
-            print(f"[DEBUG] Ошибка при использовании OSM API: {e}")
+            logger.error(f"Ошибка при использовании OSM API: {e}")
         
         # Создаем геокодер geopy
-        print(f"[DEBUG] Пробуем определить через geopy")
+        logger.info(f"Пробуем определить через geopy")
         geolocator = Nominatim(user_agent="car_raffle_app_v2")
         
         # Получаем информацию о местоположении по координатам
@@ -340,7 +397,7 @@ def get_location_from_coordinates(lat, lng):
         
         if location and location.raw.get('address'):
             address_data = location.raw['address']
-            print(f"[DEBUG] Данные от geopy: {address_data}")
+            logger.info(f"Данные от geopy: {address_data}")
             
             city = address_data.get('city', '').lower()
             if not city:
@@ -365,7 +422,7 @@ def get_location_from_coordinates(lat, lng):
                 if 42.9 <= float(lat) <= 43.1 and 47.3 <= float(lng) <= 47.6:
                     city = 'махачкала'
             
-            print(f"[DEBUG] Определен город через geopy: {city}")
+            logger.info(f"Определен город через geopy: {city}")
                     
             return {
                 'city': city,
@@ -373,11 +430,11 @@ def get_location_from_coordinates(lat, lng):
                 'country': address_data.get('country', '')
             }
         else:
-            print(f"[DEBUG] Geopy не вернул данных для координат {lat}, {lng}")
+            logger.warning(f"Geopy не вернул данных для координат {lat}, {lng}")
         
         # Проверка попадания в область Махачкалы (грубый вариант)
         if 42.9 <= float(lat) <= 43.1 and 47.3 <= float(lng) <= 47.6:
-            print(f"[DEBUG] Координаты {lat}, {lng} попадают в регион Махачкалы")
+            logger.info(f"Координаты {lat}, {lng} попадают в регион Махачкалы")
             return {
                 'city': 'махачкала',
                 'region': 'Дагестан',
@@ -385,14 +442,14 @@ def get_location_from_coordinates(lat, lng):
             }
             
         # В случае неудачи, возвращаем данные для всей России
-        print(f"[DEBUG] Не удалось определить город по координатам, возвращаем данные по умолчанию")
+        logger.warning(f"Не удалось определить город по координатам, возвращаем данные по умолчанию")
         return {
             'city': 'неизвестный город',
             'region': 'неизвестный регион',
             'country': 'Россия'
         }
     except Exception as e:
-        print(f"[DEBUG] Критическая ошибка при определении местоположения по координатам: {e}")
+        logger.error(f"Критическая ошибка при определении местоположения по координатам: {e}")
         # Безопасное возвращение значения по умолчанию в случае ошибки
         return {
             'city': 'неизвестный город',
@@ -516,48 +573,58 @@ def check_coordinates():
     lat = request.args.get('lat')
     lng = request.args.get('lng')
     
-    print(f"[DEBUG] Запрос на проверку координат: lat={lat}, lng={lng}")
+    logger.info(f"Запрос на проверку координат: lat={lat}, lng={lng}")
     
     if not lat or not lng:
-        print("[DEBUG] Не указаны координаты в запросе")
+        logger.warning("Не указаны координаты в запросе")
         return jsonify({"status": "error", "message": "Не указаны координаты"})
     
-    # Извлекаем реальный IP-адрес пользователя
-    ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
-    if ip_address and ',' in ip_address:
-        # Получаем первый IP в списке, если их несколько
-        ip_address = ip_address.split(',')[0].strip()
-    
-    print(f"[DEBUG] IP-адрес пользователя: {ip_address}")
+    # Извлекаем реальный IP-адрес пользователя с учетом особенностей Render
+    ip_address = get_client_ip()
+    logger.info(f"IP-адрес пользователя: {ip_address}")
     
     try:
+        # На Render сразу разрешаем доступ
+        if IS_RENDER:
+            logger.info("Режим Render: пропускаем проверку координат")
+            return jsonify({
+                "status": "success", 
+                "allowed": True,
+                "city": "махачкала (render)"
+            })
+            
         location = get_location_from_coordinates(lat, lng)
         
         if not location:
-            print("[DEBUG] Не удалось определить местоположение по координатам")
+            logger.warning("Не удалось определить местоположение по координатам")
             # Если не удалось определить по координатам, пробуем по IP
-            print("[DEBUG] Пробуем определить по IP-адресу")
+            logger.info("Пробуем определить по IP-адресу")
             location = get_location_from_ip(ip_address)
             
             if not location:
-                print("[DEBUG] Не удалось определить местоположение ни по координатам, ни по IP")
-                return jsonify({"status": "error", "message": "Не удалось определить местоположение"})
+                logger.error("Не удалось определить местоположение ни по координатам, ни по IP")
+                # Для безопасности разрешаем доступ
+                return jsonify({
+                    "status": "success", 
+                    "allowed": True,
+                    "city": "махачкала (аварийный режим)"
+                })
         
         city = location.get('city', '').lower()
-        print(f"[DEBUG] Определенный город: {city}")
+        logger.info(f"Определенный город: {city}")
         
         # Дополнительная проверка для неизвестных городов в Дагестане
         if city == 'неизвестный город' and location.get('region', '').lower() == 'дагестан':
-            print("[DEBUG] Неизвестный город в Дагестане, предполагаем Махачкалу")
+            logger.info("Неизвестный город в Дагестане, предполагаем Махачкалу")
             city = 'махачкала'
             
         # Для хостинга и тестирования - принудительно разрешаем всем
         if os.environ.get('ALLOW_ALL_LOCATIONS') == 'true':
-            print("[DEBUG] ALLOW_ALL_LOCATIONS=true, разрешаем участие для всех")
+            logger.info("ALLOW_ALL_LOCATIONS=true, разрешаем участие для всех")
             allowed = True
         else:
             allowed = check_location_allowed(city)
-            print(f"[DEBUG] Результат проверки города {city}: разрешено={allowed}")
+            logger.info(f"Результат проверки города {city}: разрешено={allowed}")
         
         return jsonify({
             "status": "success", 
@@ -565,7 +632,7 @@ def check_coordinates():
             "city": city
         })
     except Exception as e:
-        print(f"[DEBUG] Ошибка при обработке запроса координат: {e}")
+        logger.error(f"Ошибка при обработке запроса координат: {e}")
         # В случае ошибки разрешаем пользователю участвовать
         return jsonify({
             "status": "success", 
@@ -576,24 +643,29 @@ def check_coordinates():
 @app.route('/check-location')
 def check_location():
     """Проверка местоположения пользователя по IP"""
-    # Извлекаем реальный IP-адрес пользователя с учетом прокси
-    ip_address = request.headers.get('X-Forwarded-For', request.remote_addr)
-    if ip_address and ',' in ip_address:
-        # Получаем первый IP в списке, если их несколько
-        ip_address = ip_address.split(',')[0].strip()
-    
-    print(f"[DEBUG] Запрос на проверку IP: {ip_address}")
+    # Извлекаем реальный IP-адрес пользователя с учетом особенностей Render
+    ip_address = get_client_ip()
+    logger.info(f"Запрос на проверку IP: {ip_address}")
     
     # Для локальной разработки используем тестовый режим
     if ip_address == '127.0.0.1' or ip_address == 'localhost':
-        print("[DEBUG] Локальная разработка, возвращаем тестовый режим")
+        logger.info("Локальная разработка, возвращаем тестовый режим")
         return jsonify({"status": "success", "allowed": True, "city": "махачкала (тестовый режим)"})
     
     try:
+        # На Render сразу разрешаем доступ
+        if IS_RENDER:
+            logger.info("Режим Render: пропускаем проверку IP")
+            return jsonify({
+                "status": "success", 
+                "allowed": True,
+                "city": "махачкала (render)"
+            })
+            
         location = get_location_from_ip(ip_address)
         
         if not location:
-            print(f"[DEBUG] Не удалось определить местоположение для IP {ip_address}")
+            logger.warning(f"Не удалось определить местоположение для IP {ip_address}")
             # Если не удалось определить местоположение, временно разрешаем
             return jsonify({
                 "status": "success", 
@@ -602,15 +674,15 @@ def check_location():
             })
         
         city = location.get('city', '').lower()
-        print(f"[DEBUG] Определенный город по IP: {city}")
+        logger.info(f"Определенный город по IP: {city}")
         
         # Для хостинга и тестирования - принудительно разрешаем всем
         if os.environ.get('ALLOW_ALL_LOCATIONS') == 'true':
-            print("[DEBUG] ALLOW_ALL_LOCATIONS=true, разрешаем участие для всех")
+            logger.info("ALLOW_ALL_LOCATIONS=true, разрешаем участие для всех")
             allowed = True
         else:
             allowed = check_location_allowed(city)
-            print(f"[DEBUG] Результат проверки города {city}: разрешено={allowed}")
+            logger.info(f"Результат проверки города {city}: разрешено={allowed}")
         
         return jsonify({
             "status": "success", 
@@ -618,7 +690,7 @@ def check_location():
             "city": city
         })
     except Exception as e:
-        print(f"[DEBUG] Ошибка при обработке запроса IP: {e}")
+        logger.error(f"Ошибка при обработке запроса IP: {e}")
         # В случае ошибки разрешаем пользователю участвовать
         return jsonify({
             "status": "success", 
@@ -997,7 +1069,8 @@ def export_to_excel():
         )
     except Exception as e:
         import traceback
-        print(traceback.format_exc())  # Печать полного трейсбека ошибки в консоль
+        logger.error(f"Ошибка при создании Excel-файла: {str(e)}")
+        logger.error(traceback.format_exc())  # Печать полного трейсбека ошибки в консоль
         flash(f'Ошибка при создании Excel-файла: {str(e)}', 'danger')
         return redirect(url_for('admin'))
 
@@ -1024,6 +1097,7 @@ def update_whatsapp_link():
         
         return jsonify({'success': True, 'message': 'Ссылка успешно обновлена'})
     except Exception as e:
+        logger.error(f"Ошибка при обновлении ссылки на WhatsApp-сообщество: {str(e)}")
         return jsonify({'success': False, 'message': str(e)}), 500
 
 @app.route('/update-backup-settings', methods=['POST'])
@@ -1113,6 +1187,7 @@ def update_backup_settings():
         
         return jsonify({'success': True, 'message': 'Настройки резервного копирования обновлены.' + next_backup_message})
     except Exception as e:
+        logger.error(f"Ошибка при обновлении настроек резервного копирования: {str(e)}")
         return jsonify({'success': False, 'message': str(e)}), 500
 
 @app.route('/create-backup', methods=['POST'])
@@ -1151,6 +1226,7 @@ def manual_backup():
         else:
             return jsonify({'success': False, 'message': 'Не удалось создать резервную копию'}), 500
     except Exception as e:
+        logger.error(f"Ошибка при создании резервной копии: {str(e)}")
         return jsonify({'success': False, 'message': str(e)}), 500
 
 # Добавляем настройку для сжатия ответов
@@ -1171,16 +1247,16 @@ def send_backup_to_yadisk(json_data, token):
     """Загрузка резервной копии данных на Яндекс.Диск"""
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        print(f"[{datetime.now()}] Начинаем создание резервной копии и загрузку на Яндекс.Диск")
+        logger.info(f"[{datetime.now()}] Начинаем создание резервной копии и загрузку на Яндекс.Диск")
         
         # Создаем Excel-файл
         excel_data = create_excel_backup(json_data)
-        print(f"[{datetime.now()}] Excel файл создан в памяти")
+        logger.info(f"[{datetime.now()}] Excel файл создан в памяти")
         
         # Создаем JSON-файл
         json_str = json.dumps(json_data, ensure_ascii=False, indent=4)
         json_bytes = json_str.encode('utf-8')
-        print(f"[{datetime.now()}] JSON файл создан в памяти")
+        logger.info(f"[{datetime.now()}] JSON файл создан в памяти")
         
         # Путь на Яндекс.Диске, где будут храниться резервные копии
         folder_path = "/kvdarit_avto35_backup"
@@ -1189,7 +1265,7 @@ def send_backup_to_yadisk(json_data, token):
         headers = {"Authorization": f"OAuth {token}"}
         create_folder_url = "https://cloud-api.yandex.net/v1/disk/resources"
         
-        print(f"[{datetime.now()}] Проверяем/создаем папку {folder_path} на Яндекс.Диске")
+        logger.info(f"[{datetime.now()}] Проверяем/создаем папку {folder_path} на Яндекс.Диске")
         response = requests.put(
             create_folder_url,
             params={"path": folder_path, "overwrite": "true"},
@@ -1197,7 +1273,7 @@ def send_backup_to_yadisk(json_data, token):
         )
         
         if response.status_code not in [200, 201, 409]:  # 409 - папка уже существует
-            print(f"[{datetime.now()}] Ошибка при создании папки на Яндекс.Диске: {response.status_code}, {response.text}")
+            logger.warning(f"[{datetime.now()}] Ошибка при создании папки на Яндекс.Диске: {response.status_code}, {response.text}")
             return False
         
         # Загружаем Excel-файл
@@ -1209,19 +1285,19 @@ def send_backup_to_yadisk(json_data, token):
         }
         
         # Получаем URL для загрузки Excel-файла
-        print(f"[{datetime.now()}] Получаем URL для загрузки Excel файла")
+        logger.info(f"[{datetime.now()}] Получаем URL для загрузки Excel файла")
         response = requests.get(excel_upload_url, params=excel_params, headers=headers)
         if response.status_code == 200:
             href = response.json().get("href", "")
             # Загружаем данные на полученный URL
-            print(f"[{datetime.now()}] Загружаем Excel файл на Яндекс.Диск")
+            logger.info(f"[{datetime.now()}] Загружаем Excel файл на Яндекс.Диск")
             upload_response = requests.put(href, data=excel_data.getvalue())
             if upload_response.status_code != 201:
-                print(f"[{datetime.now()}] Ошибка при загрузке Excel-файла: {upload_response.status_code}, {upload_response.text}")
+                logger.warning(f"[{datetime.now()}] Ошибка при загрузке Excel-файла: {upload_response.status_code}, {upload_response.text}")
                 return False
-            print(f"[{datetime.now()}] Excel файл успешно загружен")
+            logger.info(f"[{datetime.now()}] Excel файл успешно загружен")
         else:
-            print(f"[{datetime.now()}] Ошибка при получении URL для загрузки Excel-файла: {response.status_code}, {response.text}")
+            logger.warning(f"[{datetime.now()}] Ошибка при получении URL для загрузки Excel-файла: {response.status_code}, {response.text}")
             return False
         
         # Загружаем JSON-файл
@@ -1232,27 +1308,26 @@ def send_backup_to_yadisk(json_data, token):
         }
         
         # Получаем URL для загрузки JSON-файла
-        print(f"[{datetime.now()}] Получаем URL для загрузки JSON файла")
+        logger.info(f"[{datetime.now()}] Получаем URL для загрузки JSON файла")
         response = requests.get(excel_upload_url, params=json_params, headers=headers)
         if response.status_code == 200:
             href = response.json().get("href", "")
             # Загружаем данные на полученный URL
-            print(f"[{datetime.now()}] Загружаем JSON файл на Яндекс.Диск")
+            logger.info(f"[{datetime.now()}] Загружаем JSON файл на Яндекс.Диск")
             upload_response = requests.put(href, data=json_bytes)
             if upload_response.status_code != 201:
-                print(f"[{datetime.now()}] Ошибка при загрузке JSON-файла: {upload_response.status_code}, {upload_response.text}")
+                logger.warning(f"[{datetime.now()}] Ошибка при загрузке JSON-файла: {upload_response.status_code}, {upload_response.text}")
                 return False
-            print(f"[{datetime.now()}] JSON файл успешно загружен")
+            logger.info(f"[{datetime.now()}] JSON файл успешно загружен")
         else:
-            print(f"[{datetime.now()}] Ошибка при получении URL для загрузки JSON-файла: {response.status_code}, {response.text}")
+            logger.warning(f"[{datetime.now()}] Ошибка при получении URL для загрузки JSON-файла: {response.status_code}, {response.text}")
             return False
         
-        print(f"[{datetime.now()}] Резервная копия успешно сохранена на Яндекс.Диске: {excel_filename}, {json_filename}")
+        logger.info(f"[{datetime.now()}] Резервная копия успешно сохранена на Яндекс.Диске: {excel_filename}, {json_filename}")
         return True
     except Exception as e:
-        import traceback
-        print(f"[{datetime.now()}] Критическая ошибка при создании резервной копии на Яндекс.Диск: {e}")
-        print(traceback.format_exc())  # Выводим полный стек вызовов для отладки
+        logger.error(f"[{datetime.now()}] Критическая ошибка при создании резервной копии на Яндекс.Диск: {e}")
+        logger.error(traceback.format_exc())  # Выводим полный стек вызовов для отладки
         return False
 
 def create_excel_backup(json_data):
@@ -1311,25 +1386,25 @@ def create_excel_backup(json_data):
 def create_backup():
     """Функция для создания и отправки резервной копии"""
     try:
-        print(f"[{datetime.now()}] Запуск процесса создания резервной копии")
+        logger.info(f"[{datetime.now()}] Запуск процесса создания резервной копии")
         settings = load_settings()
         if not settings.get('backup_settings', {}).get('enabled', False):
-            print(f"[{datetime.now()}] Резервное копирование отключено в настройках")
+            logger.info(f"[{datetime.now()}] Резервное копирование отключено в настройках")
             return False
         
         # Проверка наличия токена Яндекс.Диска
         yandex_token = settings.get('backup_settings', {}).get('yandex_token', '')
         if not yandex_token:
-            print(f"[{datetime.now()}] Не указан токен Яндекс.Диска для резервного копирования")
+            logger.info(f"[{datetime.now()}] Не указан токен Яндекс.Диска для резервного копирования")
             return False
         
         # Получаем данные участников
         participants = load_participants()
         if not participants:
-            print(f"[{datetime.now()}] Нет данных участников для резервного копирования")
+            logger.info(f"[{datetime.now()}] Нет данных участников для резервного копирования")
             return False
         
-        print(f"[{datetime.now()}] Отправка резервной копии на Яндекс.Диск (участников: {len(participants)})")
+        logger.info(f"[{datetime.now()}] Отправка резервной копии на Яндекс.Диск (участников: {len(participants)})")
         
         # Отправляем резервную копию на Яндекс.Диск
         success = send_backup_to_yadisk(participants, yandex_token)
@@ -1337,15 +1412,14 @@ def create_backup():
             # Обновляем время последнего резервного копирования
             settings['backup_settings']['last_backup'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             save_settings(settings)
-            print(f"[{datetime.now()}] Резервная копия успешно создана и отправлена")
+            logger.info(f"[{datetime.now()}] Резервная копия успешно создана и отправлена")
             return True
         else:
-            print(f"[{datetime.now()}] Ошибка при отправке резервной копии на Яндекс.Диск")
+            logger.warning(f"[{datetime.now()}] Ошибка при отправке резервной копии на Яндекс.Диск")
             return False
     except Exception as e:
-        print(f"[{datetime.now()}] Критическая ошибка при создании резервной копии: {e}")
-        import traceback
-        print(traceback.format_exc())
+        logger.error(f"[{datetime.now()}] Критическая ошибка при создании резервной копии: {e}")
+        logger.error(traceback.format_exc())
         return False
 
 # Инициализация настроек резервного копирования при запуске
@@ -1361,7 +1435,7 @@ def init_backup_settings():
 
 # Планировщик резервного копирования
 def run_scheduler():
-    print(f"[{datetime.now()}] Запущен планировщик резервного копирования")
+    logger.info(f"[{datetime.now()}] Запущен планировщик резервного копирования")
     next_time = None
     
     # Проверка токена Яндекс Диска при запуске
@@ -1370,18 +1444,18 @@ def run_scheduler():
     yandex_token = backup_settings.get('yandex_token', '')
     
     if not yandex_token:
-        print(f"[{datetime.now()}] ВНИМАНИЕ: Токен Яндекс.Диска не задан. Резервное копирование не будет работать!")
+        logger.warning(f"[{datetime.now()}] ВНИМАНИЕ: Токен Яндекс.Диска не задан. Резервное копирование не будет работать!")
     else:
-        print(f"[{datetime.now()}] Токен Яндекс.Диска найден: {yandex_token[:5]}...{yandex_token[-5:]}")
+        logger.info(f"[{datetime.now()}] Токен Яндекс.Диска найден: {yandex_token[:5]}...{yandex_token[-5:]}")
     
     # При запуске создаем тестовую резервную копию, чтобы проверить работоспособность
     if backup_settings.get('enabled', False):
-        print(f"[{datetime.now()}] Создание тестовой резервной копии при запуске планировщика...")
+        logger.info(f"[{datetime.now()}] Создание тестовой резервной копии при запуске планировщика...")
         success = create_backup()
         if success:
-            print(f"[{datetime.now()}] Тестовая резервная копия успешно создана")
+            logger.info(f"[{datetime.now()}] Тестовая резервная копия успешно создана")
         else:
-            print(f"[{datetime.now()}] ОШИБКА: Не удалось создать тестовую резервную копию")
+            logger.warning(f"[{datetime.now()}] ОШИБКА: Не удалось создать тестовую резервную копию")
     
     while True:
         settings = load_settings()
@@ -1389,11 +1463,11 @@ def run_scheduler():
         
         if not backup_settings.get('enabled', False):
             # Если резервное копирование отключено, проверяем раз в минуту
-            print(f"[{datetime.now()}] Резервное копирование отключено в настройках")
+            logger.info(f"[{datetime.now()}] Резервное копирование отключено в настройках")
             # Проверяем на событие каждую секунду для более быстрого отклика
             for _ in range(60):
                 if scheduler_event.is_set():
-                    print(f"[{datetime.now()}] Получен сигнал об изменении настроек")
+                    logger.info(f"[{datetime.now()}] Получен сигнал об изменении настроек")
                     scheduler_event.clear()  # Сбрасываем флаг
                     break
                 time.sleep(1)
@@ -1403,7 +1477,7 @@ def run_scheduler():
         
         # Если было событие изменения настроек, сбрасываем расчет времени и проверяем сразу
         if scheduler_event.is_set():
-            print(f"[{current_time}] Обрабатываем изменение настроек резервного копирования")
+            logger.info(f"[{current_time}] Обрабатываем изменение настроек резервного копирования")
             scheduler_event.clear()  # Сбрасываем флаг
             next_time = None
             # Если включён пользовательский интервал и интервал короткий - создаем резервную копию немедленно
@@ -1411,15 +1485,15 @@ def run_scheduler():
             if interval == 'custom':
                 value = int(backup_settings.get('custom_value', 24))
                 unit = backup_settings.get('custom_unit', 'hours')
-                print(f"[{current_time}] Новый интервал резервного копирования: {value} {unit}")
+                logger.info(f"[{current_time}] Новый интервал резервного копирования: {value} {unit}")
                 if unit in ['seconds', 'minutes'] or (unit == 'hours' and value < 1):
-                    print(f"[{current_time}] Создание резервной копии немедленно после изменения настроек")
+                    logger.info(f"[{current_time}] Создание резервной копии немедленно после изменения настроек")
                     if create_backup():
                         # Обновляем время последнего резервного копирования в файле настроек
                         settings = load_settings()
                         settings['backup_settings']['last_backup'] = current_time.strftime('%Y-%m-%d %H:%M:%S')
                         save_settings(settings)
-                        print(f"[{current_time}] Обновлено время последнего резервного копирования: {settings['backup_settings']['last_backup']}")
+                        logger.info(f"[{current_time}] Обновлено время последнего резервного копирования: {settings['backup_settings']['last_backup']}")
         
         # Рассчитываем время следующего резервного копирования
         if next_time is None:
@@ -1431,13 +1505,13 @@ def run_scheduler():
                 next_time = current_time.replace(hour=3, minute=0, second=0, microsecond=0)
                 if current_time >= next_time:
                     next_time += timedelta(days=1)
-                print(f"[{current_time}] Следующее резервное копирование (daily): {next_time}")
+                logger.info(f"[{current_time}] Следующее резервное копирование (daily): {next_time}")
             elif interval == 'hourly':
                 # Ежечасное резервное копирование в начале часа
                 next_time = current_time.replace(minute=0, second=0, microsecond=0)
                 if current_time >= next_time:
                     next_time += timedelta(hours=1)
-                print(f"[{current_time}] Следующее резервное копирование (hourly): {next_time}")
+                logger.info(f"[{current_time}] Следующее резервное копирование (hourly): {next_time}")
             elif interval == 'custom':
                 # Произвольный интервал
                 value = int(backup_settings.get('custom_value', 24))
@@ -1449,7 +1523,7 @@ def run_scheduler():
                 if last_backup:
                     try:
                         last_backup_time = datetime.strptime(last_backup, '%Y-%m-%d %H:%M:%S')
-                        print(f"[{current_time}] Последнее резервное копирование было в: {last_backup_time}")
+                        logger.info(f"[{current_time}] Последнее резервное копирование было в: {last_backup_time}")
                         
                         # Рассчитываем следующее время на основе последнего резервного копирования
                         if unit == 'seconds':
@@ -1465,36 +1539,36 @@ def run_scheduler():
                         else:
                             next_time = last_backup_time + timedelta(hours=24)
                         
-                        print(f"[{current_time}] Следующее резервное копирование (custom {value} {unit}): {next_time}")
+                        logger.info(f"[{current_time}] Следующее резервное копирование (custom {value} {unit}): {next_time}")
                             
                         # Если рассчитанное время уже прошло, делаем резервную копию сейчас
                         if next_time <= current_time:
-                            print(f"[{current_time}] Рассчитанное время уже прошло, делаем копию сейчас")
+                            logger.info(f"[{current_time}] Рассчитанное время уже прошло, делаем копию сейчас")
                             next_time = current_time
                     except Exception as e:
-                        print(f"[{current_time}] Ошибка при разборе даты последнего бэкапа: {e}")
+                        logger.error(f"[{current_time}] Ошибка при разборе даты последнего бэкапа: {e}")
                         next_time = current_time
                 else:
                     # Если нет записи о последнем резервном копировании, делаем сейчас
-                    print(f"[{current_time}] Нет данных о последнем резервном копировании, делаем копию сейчас")
+                    logger.info(f"[{current_time}] Нет данных о последнем резервном копировании, делаем копию сейчас")
                     next_time = current_time
         
         # Проверяем, наступило ли время для создания резервной копии
         if current_time >= next_time:
-            print(f"[{current_time}] Время создания автоматической резервной копии")
+            logger.info(f"[{current_time}] Время создания автоматической резервной копии")
             # Создаем резервную копию и обновляем метку времени только в случае успеха
             if create_backup():
                 # Обновляем время последнего резервного копирования в файле настроек
                 settings = load_settings()
                 settings['backup_settings']['last_backup'] = current_time.strftime('%Y-%m-%d %H:%M:%S')
                 save_settings(settings)
-                print(f"[{current_time}] Время последнего резервного копирования обновлено: {settings['backup_settings']['last_backup']}")
+                logger.info(f"[{current_time}] Время последнего резервного копирования обновлено: {settings['backup_settings']['last_backup']}")
                 
                 # Сбрасываем счетчик для следующего резервного копирования
                 next_time = None
             else:
                 # Если копирование не удалось, попробуем снова через минуту
-                print(f"[{current_time}] Резервное копирование не удалось, следующая попытка через минуту")
+                logger.info(f"[{current_time}] Резервное копирование не удалось, следующая попытка через минуту")
                 next_time = current_time + timedelta(minutes=1)
         else:
             # Для коротких интервалов используем более частые проверки
@@ -1517,12 +1591,12 @@ def run_scheduler():
             if wait_seconds <= 0:
                 wait_seconds = 1
                 
-            print(f"[{current_time}] Ожидание {wait_seconds} сек. до следующей проверки. Следующее резервное копирование в {next_time}")
+            logger.info(f"[{current_time}] Ожидание {wait_seconds} сек. до следующей проверки. Следующее резервное копирование в {next_time}")
             
             # Разбиваем ожидание на короткие интервалы для быстрого отклика на события
             for _ in range(int(wait_seconds)):
                 if scheduler_event.is_set():
-                    print(f"[{datetime.now()}] Получен сигнал об изменении настроек во время ожидания")
+                    logger.info(f"[{datetime.now()}] Получен сигнал об изменении настроек во время ожидания")
                     break
                 time.sleep(1)
 
@@ -1531,7 +1605,7 @@ def start_backup_scheduler():
     # Запускаем планировщик в отдельном потоке вместо процесса
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
-    print("Планировщик резервного копирования запущен в отдельном потоке")
+    logger.info("Планировщик резервного копирования запущен в отдельном потоке")
 
 # Функция инициализации приложения для запуска планировщика
 def init_app(flask_app):
