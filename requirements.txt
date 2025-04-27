@@ -10,3 +10,4 @@ PyGithub
 schedule
 pymongo
 python-dotenv
+geopy
