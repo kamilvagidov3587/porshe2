@@ -52,187 +52,6 @@ if IS_RENDER and os.environ.get('ALLOW_ALL_LOCATIONS') is None:
     os.environ['ALLOW_ALL_LOCATIONS'] = 'true'
     logger.info("Установлен режим ALLOW_ALL_LOCATIONS=true на платформе Render")
 
-# Функция для безопасного получения реального IP-адреса клиента
-def get_client_ip():
-    """Получение реального IP-адреса клиента с учетом особенностей Render"""
-    if IS_RENDER:
-        # На Render IP может быть в нескольких заголовках
-        ip = request.headers.get('X-Forwarded-For')
-        if ip:
-            # Берем первый IP из списка (может быть несколько через запятую)
-            ip = ip.split(',')[0].strip()
-            logger.info(f"IP из X-Forwarded-For: {ip}")
-            return ip
-            
-        # Проверяем другие возможные заголовки
-        for header in ['X-Real-IP', 'CF-Connecting-IP', 'True-Client-IP']:
-            ip = request.headers.get(header)
-            if ip:
-                logger.info(f"IP из {header}: {ip}")
-                return ip
-                
-    # Если не нашли в заголовках или не на Render, используем стандартный метод
-    ip = request.remote_addr
-    logger.info(f"IP из remote_addr: {ip}")
-    return ip
-
-# Кэш для данных о местоположении по IP
-ip_location_cache = {}
-
-# Время жизни кэша местоположения (1 час)
-IP_CACHE_TTL = 3600
-
-@lru_cache(maxsize=128)
-def get_location_from_ip(ip_address):
-    """Получение информации о местоположении по IP-адресу с использованием нескольких методов"""
-    # Проверяем кэш
-    current_time = datetime.now().timestamp()
-    if ip_address in ip_location_cache:
-        cache_entry = ip_location_cache[ip_address]
-        if current_time - cache_entry['timestamp'] < IP_CACHE_TTL:
-            logger.info(f"Использован кэш для IP {ip_address}")
-            return cache_entry['data']
-    
-    try:
-        # Для тестового режима и локальной разработки
-        if ip_address == '127.0.0.1' or ip_address == 'localhost':
-            logger.info(f"Локальная разработка, возвращаем тестовые данные для IP: {ip_address}")
-            return {
-                'city': 'махачкала',
-                'region': 'Дагестан',
-                'country': 'Россия'
-            }
-        
-        # Для Render - используем упрощенный подход
-        if IS_RENDER:
-            logger.info(f"Запущено на Render, пропускаем проверку местоположения для IP: {ip_address}")
-            return {
-                'city': 'махачкала',
-                'region': 'Дагестан',
-                'country': 'Россия'
-            }
-        
-        logger.info(f"Определение местоположения для IP: {ip_address}")
-        
-        # Пытаемся использовать ip-api.com (надежный сервис)
-        try:
-            logger.info(f"Пробуем определить местоположение через ip-api.com")
-            response = requests.get(f"http://ip-api.com/json/{ip_address}", timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('status') == 'success':
-                    logger.info(f"Успешно получили данные от ip-api.com: {data}")
-                    result = {
-                        'city': data.get('city', '').lower(),
-                        'region': data.get('regionName', ''),
-                        'country': data.get('country', '')
-                    }
-                    # Сохраняем в кэш
-                    ip_location_cache[ip_address] = {
-                        'data': result,
-                        'timestamp': current_time
-                    }
-                    return result
-                else:
-                    logger.warning(f"ip-api.com вернул ошибку: {data}")
-            else:
-                logger.warning(f"ip-api.com вернул код {response.status_code}")
-        except Exception as e:
-            logger.error(f"Ошибка при использовании ip-api.com: {e}")
-        
-        # Пробуем альтернативный сервис ipinfo.io
-        try:
-            logger.info(f"Пробуем определить местоположение через ipinfo.io")
-            response = requests.get(f"https://ipinfo.io/{ip_address}/json", timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                logger.info(f"Получили данные от ipinfo.io: {data}")
-                if 'city' in data:
-                    result = {
-                        'city': data.get('city', '').lower(),
-                        'region': data.get('region', ''),
-                        'country': data.get('country', '')
-                    }
-                    # Сохраняем в кэш
-                    ip_location_cache[ip_address] = {
-                        'data': result,
-                        'timestamp': current_time
-                    }
-                    return result
-            else:
-                logger.warning(f"ipinfo.io вернул код {response.status_code}")
-        except Exception as e:
-            logger.error(f"Ошибка при использовании ipinfo.io: {e}")
-        
-        # Как запасной вариант для IP-адресов Дагестана, определяем по диапазону
-        # Для примера (это надо заменить на реальные диапазоны Дагестана)
-        dagestan_ip_ranges = [
-            '176.15.', '95.153.', '62.183.', '5.164.', '46.61.'
-        ]
-        
-        for prefix in dagestan_ip_ranges:
-            if ip_address.startswith(prefix):
-                logger.info(f"IP {ip_address} определен как IP из Дагестана по диапазону")
-                return {
-                    'city': 'махачкала',
-                    'region': 'Дагестан',
-                    'country': 'Россия'
-                }
-        
-        # Пытаемся использовать geopy как последний вариант
-        logger.info(f"Пробуем определить местоположение через geopy")
-        try:
-            geolocator = Nominatim(user_agent="car_raffle_app_v2")
-            location = geolocator.geocode(ip_address, timeout=5)
-            
-            if location:
-                logger.info(f"Geopy нашел местоположение: {location.address}")
-                address = geolocator.reverse(f"{location.latitude}, {location.longitude}", timeout=5)
-                
-                if address and address.raw.get('address'):
-                    address_data = address.raw['address']
-                    city = address_data.get('city', '').lower()
-                    if not city:
-                        city = address_data.get('town', '').lower()
-                    if not city:
-                        city = address_data.get('village', '').lower()
-                    
-                    result = {
-                        'city': city,
-                        'region': address_data.get('state', ''),
-                        'country': address_data.get('country', '')
-                    }
-                    
-                    logger.info(f"Определены данные через geopy: {result}")
-                    
-                    # Сохраняем в кэш
-                    ip_location_cache[ip_address] = {
-                        'data': result,
-                        'timestamp': current_time
-                    }
-                    return result
-            else:
-                logger.warning(f"Geopy не смог найти местоположение для IP {ip_address}")
-        except (GeocoderTimedOut, GeocoderServiceError) as e:
-            logger.error(f"Ошибка при определении местоположения через geopy: {e}")
-        
-        # Временный вариант: возвращаем общие данные для России
-        logger.warning(f"Не удалось определить город, возвращаем общие данные для России")
-        return {
-            'city': 'махачкала', # Изменено на махачкалу для Render
-            'region': 'Дагестан',
-            'country': 'Россия'
-        }
-        
-    except Exception as e:
-        logger.error(f"Критическая ошибка при определении местоположения: {e}")
-        # Безопасное возвращение значения по умолчанию в случае ошибки
-        return {
-            'city': 'махачкала', # Изменено на махачкалу для Render
-            'region': 'Дагестан',
-            'country': 'Россия'
-        }
-
 # Путь к файлу данных
 DATA_FILE = os.environ.get('DATA_FILE', os.path.join(os.path.dirname(__file__), 'participants.json'))
 
@@ -352,6 +171,178 @@ else:
     def check_location_allowed(city):
         return city in ALLOWED_CITIES
 
+# Функция для безопасного получения реального IP-адреса клиента
+def get_client_ip():
+    """Получение реального IP-адреса клиента с учетом особенностей Render"""
+    if IS_RENDER:
+        # На Render IP может быть в нескольких заголовках
+        ip = request.headers.get('X-Forwarded-For')
+        if ip:
+            # Берем первый IP из списка (может быть несколько через запятую)
+            ip = ip.split(',')[0].strip()
+            logger.info(f"IP из X-Forwarded-For: {ip}")
+            return ip
+            
+        # Проверяем другие возможные заголовки
+        for header in ['X-Real-IP', 'CF-Connecting-IP', 'True-Client-IP']:
+            ip = request.headers.get(header)
+            if ip:
+                logger.info(f"IP из {header}: {ip}")
+                return ip
+                
+    # Если не нашли в заголовках или не на Render, используем стандартный метод
+    ip = request.remote_addr
+    logger.info(f"IP из remote_addr: {ip}")
+    return ip
+
+# Кэш для данных о местоположении по IP
+ip_location_cache = {}
+
+# Время жизни кэша местоположения (1 час)
+IP_CACHE_TTL = 3600
+
+@lru_cache(maxsize=128)
+def get_location_from_ip(ip_address):
+    """Получение информации о местоположении по IP-адресу с использованием нескольких методов"""
+    # Проверяем кэш
+    current_time = datetime.now().timestamp()
+    if ip_address in ip_location_cache:
+        cache_entry = ip_location_cache[ip_address]
+        if current_time - cache_entry['timestamp'] < IP_CACHE_TTL:
+            logger.info(f"Использован кэш для IP {ip_address}")
+            return cache_entry['data']
+    
+    try:
+        # Для тестового режима и локальной разработки
+        if ip_address == '127.0.0.1' or ip_address == 'localhost':
+            logger.info(f"Локальная разработка, возвращаем тестовые данные для IP: {ip_address}")
+            return {
+                'city': 'махачкала',
+                'region': 'Дагестан',
+                'country': 'Россия'
+            }
+        
+        logger.info(f"Определение местоположения для IP: {ip_address}")
+        
+        # Пытаемся использовать ip-api.com (надежный сервис)
+        try:
+            logger.info(f"Пробуем определить местоположение через ip-api.com")
+            response = requests.get(f"http://ip-api.com/json/{ip_address}", timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('status') == 'success':
+                    logger.info(f"Успешно получили данные от ip-api.com: {data}")
+                    result = {
+                        'city': data.get('city', '').lower(),
+                        'region': data.get('regionName', ''),
+                        'country': data.get('country', '')
+                    }
+                    # Сохраняем в кэш
+                    ip_location_cache[ip_address] = {
+                        'data': result,
+                        'timestamp': current_time
+                    }
+                    return result
+                else:
+                    logger.warning(f"ip-api.com вернул ошибку: {data}")
+            else:
+                logger.warning(f"ip-api.com вернул код {response.status_code}")
+        except Exception as e:
+            logger.error(f"Ошибка при использовании ip-api.com: {e}")
+        
+        # Пробуем альтернативный сервис ipinfo.io
+        try:
+            logger.info(f"Пробуем определить местоположение через ipinfo.io")
+            response = requests.get(f"https://ipinfo.io/{ip_address}/json", timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                logger.info(f"Получили данные от ipinfo.io: {data}")
+                if 'city' in data:
+                    result = {
+                        'city': data.get('city', '').lower(),
+                        'region': data.get('region', ''),
+                        'country': data.get('country', '')
+                    }
+                    # Сохраняем в кэш
+                    ip_location_cache[ip_address] = {
+                        'data': result,
+                        'timestamp': current_time
+                    }
+                    return result
+            else:
+                logger.warning(f"ipinfo.io вернул код {response.status_code}")
+        except Exception as e:
+            logger.error(f"Ошибка при использовании ipinfo.io: {e}")
+        
+        # Как запасной вариант для IP-адресов Дагестана, определяем по диапазону
+        # Для примера (это надо заменить на реальные диапазоны Дагестана)
+        dagestan_ip_ranges = [
+            '176.15.', '95.153.', '62.183.', '5.164.', '46.61.'
+        ]
+        
+        for prefix in dagestan_ip_ranges:
+            if ip_address.startswith(prefix):
+                logger.info(f"IP {ip_address} определен как IP из Дагестана по диапазону")
+                return {
+                    'city': 'махачкала',
+                    'region': 'Дагестан',
+                    'country': 'Россия'
+                }
+        
+        # Пытаемся использовать geopy как последний вариант
+        logger.info(f"Пробуем определить местоположение через geopy")
+        try:
+            geolocator = Nominatim(user_agent="car_raffle_app_v2")
+            location = geolocator.geocode(ip_address, timeout=5)
+            
+            if location:
+                logger.info(f"Geopy нашел местоположение: {location.address}")
+                address = geolocator.reverse(f"{location.latitude}, {location.longitude}", timeout=5)
+                
+                if address and address.raw.get('address'):
+                    address_data = address.raw['address']
+                    city = address_data.get('city', '').lower()
+                    if not city:
+                        city = address_data.get('town', '').lower()
+                    if not city:
+                        city = address_data.get('village', '').lower()
+                    
+                    result = {
+                        'city': city,
+                        'region': address_data.get('state', ''),
+                        'country': address_data.get('country', '')
+                    }
+                    
+                    logger.info(f"Определены данные через geopy: {result}")
+                    
+                    # Сохраняем в кэш
+                    ip_location_cache[ip_address] = {
+                        'data': result,
+                        'timestamp': current_time
+                    }
+                    return result
+            else:
+                logger.warning(f"Geopy не смог найти местоположение для IP {ip_address}")
+        except (GeocoderTimedOut, GeocoderServiceError) as e:
+            logger.error(f"Ошибка при определении местоположения через geopy: {e}")
+        
+        # Временный вариант: возвращаем данные по умолчанию
+        logger.warning(f"Не удалось определить город, возвращаем неизвестный город")
+        return {
+            'city': 'неизвестный город',
+            'region': 'неизвестный регион',
+            'country': 'Россия'
+        }
+        
+    except Exception as e:
+        logger.error(f"Критическая ошибка при определении местоположения: {e}")
+        # Безопасное возвращение значения по умолчанию в случае ошибки
+        return {
+            'city': 'неизвестный город',
+            'region': 'неизвестный регион',
+            'country': 'Россия'
+        }
+
 @lru_cache(maxsize=128)
 def get_location_from_coordinates(lat, lng):
     """Получение информации о местоположении по координатам с использованием нескольких методов"""
@@ -441,7 +432,7 @@ def get_location_from_coordinates(lat, lng):
                 'country': 'Россия'
             }
             
-        # В случае неудачи, возвращаем данные для всей России
+        # В случае неудачи, возвращаем данные по умолчанию
         logger.warning(f"Не удалось определить город по координатам, возвращаем данные по умолчанию")
         return {
             'city': 'неизвестный город',
@@ -584,15 +575,7 @@ def check_coordinates():
     logger.info(f"IP-адрес пользователя: {ip_address}")
     
     try:
-        # На Render сразу разрешаем доступ
-        if IS_RENDER:
-            logger.info("Режим Render: пропускаем проверку координат")
-            return jsonify({
-                "status": "success", 
-                "allowed": True,
-                "city": "махачкала (render)"
-            })
-            
+        # Пытаемся определить местоположение даже на Render
         location = get_location_from_coordinates(lat, lng)
         
         if not location:
@@ -603,12 +586,15 @@ def check_coordinates():
             
             if not location:
                 logger.error("Не удалось определить местоположение ни по координатам, ни по IP")
-                # Для безопасности разрешаем доступ
-                return jsonify({
-                    "status": "success", 
-                    "allowed": True,
-                    "city": "махачкала (аварийный режим)"
-                })
+                # На Render разрешаем доступ в любом случае
+                if IS_RENDER:
+                    return jsonify({
+                        "status": "success", 
+                        "allowed": True,
+                        "city": "неизвестный город (render)"
+                    })
+                else:
+                    return jsonify({"status": "error", "message": "Не удалось определить местоположение"})
         
         city = location.get('city', '').lower()
         logger.info(f"Определенный город: {city}")
@@ -619,8 +605,8 @@ def check_coordinates():
             city = 'махачкала'
             
         # Для хостинга и тестирования - принудительно разрешаем всем
-        if os.environ.get('ALLOW_ALL_LOCATIONS') == 'true':
-            logger.info("ALLOW_ALL_LOCATIONS=true, разрешаем участие для всех")
+        if os.environ.get('ALLOW_ALL_LOCATIONS') == 'true' or IS_RENDER:
+            logger.info("ALLOW_ALL_LOCATIONS=true или Render, разрешаем участие для всех")
             allowed = True
         else:
             allowed = check_location_allowed(city)
@@ -633,12 +619,15 @@ def check_coordinates():
         })
     except Exception as e:
         logger.error(f"Ошибка при обработке запроса координат: {e}")
-        # В случае ошибки разрешаем пользователю участвовать
-        return jsonify({
-            "status": "success", 
-            "allowed": True,
-            "city": "махачкала (аварийный режим)"
-        })
+        # В случае ошибки на Render разрешаем пользователю участвовать
+        if IS_RENDER:
+            return jsonify({
+                "status": "success", 
+                "allowed": True,
+                "city": "неизвестный город (ошибка определения)"
+            })
+        else:
+            return jsonify({"status": "error", "message": f"Ошибка при определении местоположения: {str(e)}"})
 
 @app.route('/check-location')
 def check_location():
@@ -653,32 +642,27 @@ def check_location():
         return jsonify({"status": "success", "allowed": True, "city": "махачкала (тестовый режим)"})
     
     try:
-        # На Render сразу разрешаем доступ
-        if IS_RENDER:
-            logger.info("Режим Render: пропускаем проверку IP")
-            return jsonify({
-                "status": "success", 
-                "allowed": True,
-                "city": "махачкала (render)"
-            })
-            
+        # Пытаемся определить местоположение даже на Render
         location = get_location_from_ip(ip_address)
         
         if not location:
             logger.warning(f"Не удалось определить местоположение для IP {ip_address}")
-            # Если не удалось определить местоположение, временно разрешаем
-            return jsonify({
-                "status": "success", 
-                "allowed": True,
-                "city": "махачкала (аварийный режим)"
-            })
+            # На Render разрешаем доступ в любом случае
+            if IS_RENDER:
+                return jsonify({
+                    "status": "success", 
+                    "allowed": True,
+                    "city": "неизвестный город (render)"
+                })
+            else:
+                return jsonify({"status": "error", "message": "Не удалось определить местоположение"})
         
         city = location.get('city', '').lower()
         logger.info(f"Определенный город по IP: {city}")
         
         # Для хостинга и тестирования - принудительно разрешаем всем
-        if os.environ.get('ALLOW_ALL_LOCATIONS') == 'true':
-            logger.info("ALLOW_ALL_LOCATIONS=true, разрешаем участие для всех")
+        if os.environ.get('ALLOW_ALL_LOCATIONS') == 'true' or IS_RENDER:
+            logger.info("ALLOW_ALL_LOCATIONS=true или Render, разрешаем участие для всех")
             allowed = True
         else:
             allowed = check_location_allowed(city)
@@ -691,12 +675,15 @@ def check_location():
         })
     except Exception as e:
         logger.error(f"Ошибка при обработке запроса IP: {e}")
-        # В случае ошибки разрешаем пользователю участвовать
-        return jsonify({
-            "status": "success", 
-            "allowed": True,
-            "city": "махачкала (аварийный режим)"
-        })
+        # В случае ошибки на Render разрешаем пользователю участвовать
+        if IS_RENDER:
+            return jsonify({
+                "status": "success", 
+                "allowed": True,
+                "city": "неизвестный город (ошибка определения)"
+            })
+        else:
+            return jsonify({"status": "error", "message": f"Ошибка при определении местоположения: {str(e)}"})
 
 @app.route('/check-phone')
 def check_phone():
