@@ -47,10 +47,10 @@ app.wsgi_app = ProxyFix(
 # Переменная для определения, что приложение работает на Render
 IS_RENDER = 'RENDER' in os.environ
 
-# По умолчанию разрешаем определение местоположения на Render
+# По умолчанию НЕ разрешаем всем участвовать на Render
 if IS_RENDER and os.environ.get('ALLOW_ALL_LOCATIONS') is None:
-    os.environ['ALLOW_ALL_LOCATIONS'] = 'true'
-    logger.info("Установлен режим ALLOW_ALL_LOCATIONS=true на платформе Render")
+    os.environ['ALLOW_ALL_LOCATIONS'] = 'false'
+    logger.info("Установлен режим ALLOW_ALL_LOCATIONS=false на платформе Render")
 
 # Путь к файлу данных
 DATA_FILE = os.environ.get('DATA_FILE', os.path.join(os.path.dirname(__file__), 'participants.json'))
@@ -575,7 +575,7 @@ def check_coordinates():
     logger.info(f"IP-адрес пользователя: {ip_address}")
     
     try:
-        # Пытаемся определить местоположение даже на Render
+        # Пытаемся определить местоположение
         location = get_location_from_coordinates(lat, lng)
         
         if not location:
@@ -586,15 +586,7 @@ def check_coordinates():
             
             if not location:
                 logger.error("Не удалось определить местоположение ни по координатам, ни по IP")
-                # На Render разрешаем доступ в любом случае
-                if IS_RENDER:
-                    return jsonify({
-                        "status": "success", 
-                        "allowed": True,
-                        "city": "неизвестный город (render)"
-                    })
-                else:
-                    return jsonify({"status": "error", "message": "Не удалось определить местоположение"})
+                return jsonify({"status": "error", "message": "Не удалось определить местоположение"})
         
         city = location.get('city', '').lower()
         logger.info(f"Определенный город: {city}")
@@ -604,11 +596,13 @@ def check_coordinates():
             logger.info("Неизвестный город в Дагестане, предполагаем Махачкалу")
             city = 'махачкала'
             
-        # Для хостинга и тестирования - принудительно разрешаем всем
-        if os.environ.get('ALLOW_ALL_LOCATIONS') == 'true' or IS_RENDER:
-            logger.info("ALLOW_ALL_LOCATIONS=true или Render, разрешаем участие для всех")
+        # Проверяем, разрешен ли данный город
+        if os.environ.get('ALLOW_ALL_LOCATIONS') == 'true':
+            # Режим тестирования: разрешаем всем
+            logger.info("ALLOW_ALL_LOCATIONS=true, разрешаем участие для всех")
             allowed = True
         else:
+            # Проверяем только по списку разрешенных городов
             allowed = check_location_allowed(city)
             logger.info(f"Результат проверки города {city}: разрешено={allowed}")
         
@@ -619,15 +613,7 @@ def check_coordinates():
         })
     except Exception as e:
         logger.error(f"Ошибка при обработке запроса координат: {e}")
-        # В случае ошибки на Render разрешаем пользователю участвовать
-        if IS_RENDER:
-            return jsonify({
-                "status": "success", 
-                "allowed": True,
-                "city": "неизвестный город (ошибка определения)"
-            })
-        else:
-            return jsonify({"status": "error", "message": f"Ошибка при определении местоположения: {str(e)}"})
+        return jsonify({"status": "error", "message": f"Ошибка при определении местоположения: {str(e)}"})
 
 @app.route('/check-location')
 def check_location():
@@ -642,29 +628,23 @@ def check_location():
         return jsonify({"status": "success", "allowed": True, "city": "махачкала (тестовый режим)"})
     
     try:
-        # Пытаемся определить местоположение даже на Render
+        # Пытаемся определить местоположение
         location = get_location_from_ip(ip_address)
         
         if not location:
             logger.warning(f"Не удалось определить местоположение для IP {ip_address}")
-            # На Render разрешаем доступ в любом случае
-            if IS_RENDER:
-                return jsonify({
-                    "status": "success", 
-                    "allowed": True,
-                    "city": "неизвестный город (render)"
-                })
-            else:
-                return jsonify({"status": "error", "message": "Не удалось определить местоположение"})
+            return jsonify({"status": "error", "message": "Не удалось определить местоположение"})
         
         city = location.get('city', '').lower()
         logger.info(f"Определенный город по IP: {city}")
         
-        # Для хостинга и тестирования - принудительно разрешаем всем
-        if os.environ.get('ALLOW_ALL_LOCATIONS') == 'true' or IS_RENDER:
-            logger.info("ALLOW_ALL_LOCATIONS=true или Render, разрешаем участие для всех")
+        # Проверяем, разрешен ли данный город
+        if os.environ.get('ALLOW_ALL_LOCATIONS') == 'true':
+            # Режим тестирования: разрешаем всем
+            logger.info("ALLOW_ALL_LOCATIONS=true, разрешаем участие для всех")
             allowed = True
         else:
+            # Проверяем только по списку разрешенных городов
             allowed = check_location_allowed(city)
             logger.info(f"Результат проверки города {city}: разрешено={allowed}")
         
@@ -675,15 +655,7 @@ def check_location():
         })
     except Exception as e:
         logger.error(f"Ошибка при обработке запроса IP: {e}")
-        # В случае ошибки на Render разрешаем пользователю участвовать
-        if IS_RENDER:
-            return jsonify({
-                "status": "success", 
-                "allowed": True,
-                "city": "неизвестный город (ошибка определения)"
-            })
-        else:
-            return jsonify({"status": "error", "message": f"Ошибка при определении местоположения: {str(e)}"})
+        return jsonify({"status": "error", "message": f"Ошибка при определении местоположения: {str(e)}"})
 
 @app.route('/check-phone')
 def check_phone():
